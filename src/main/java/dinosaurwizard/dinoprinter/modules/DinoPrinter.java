@@ -46,9 +46,12 @@ import net.minecraft.world.entity.player.Input;
 import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.CreativeModeTab;
+import net.minecraft.world.item.CreativeModeTabs;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.SignBlock;
 import net.minecraft.world.level.block.state.BlockState;
@@ -248,6 +251,13 @@ public class DinoPrinter extends Module {
         .description("Blocks in your hotbar will have placement priority over blocks inside your inventory.")
         .defaultValue(true)
         .visible(() -> autoSwitch.get() && allowInventory.get())
+        .build()
+    );
+
+    private final Setting<Boolean> creativeRefill = sgInventory.add(new BoolSetting.Builder()
+        .name("creative-refill")
+        .description("Automatically takes missing items from Creative tabs into the 9-slot hotbar, replacing existing block stacks when needed.")
+        .defaultValue(false)
         .build()
     );
 
@@ -662,19 +672,101 @@ public class DinoPrinter extends Module {
         }
     }
 
-    // Find the slot of an item we can print with
+    // Find the slot of an item we can print with.
+    // Creative refill is intentionally restricted to the 9 hotbar slots.
     private int getItemSlot(Item item) {
-        for (int i = 0; i <= SlotUtils.MAIN_END; i++) {
+        int start = 0;
+        int end = SlotUtils.MAIN_END;
+
+        if (isCreativeRefillActive()) {
+            start = autoSwitch.get() ? SlotUtils.HOTBAR_START : mc.player.getInventory().getSelectedSlot();
+            end = autoSwitch.get() ? SlotUtils.HOTBAR_END : start;
+        }
+
+        for (int i = start; i <= end; i++) {
             ItemStack stack = mainInventory.get(i);
             if (item != stack.getItem()) continue;
 
-            // If we are already in the process of moving this item into the hotbar, dont bother with the same type
             if (isSlotLocked(i)) return -1;
-
             return i;
         }
 
+        return getCreativeItemSlot(item);
+    }
+
+    private boolean isCreativeRefillActive() {
+        return creativeRefill.get()
+            && mc.player != null
+            && mc.gameMode != null
+            && mc.gameMode.getPlayerMode() == GameType.CREATIVE
+            && mc.player.hasInfiniteMaterials();
+    }
+
+    // Get a missing item from the currently available Creative inventory tabs.
+    private int getCreativeItemSlot(Item item) {
+        if (!isCreativeRefillActive() || mc.getConnection() == null) return -1;
+
+        var connection = mc.getConnection();
+        if (!connection.isFeatureEnabled(item.requiredFeatures())) return -1;
+
+        boolean hasPermissions = mc.player.canUseGameMasterBlocks() && mc.options.operatorItemsTab().get();
+        CreativeModeTabs.tryRebuildTabContents(connection.enabledFeatures(), hasPermissions, mc.player.level().registryAccess());
+
+        ItemStack creativeStack = ItemStack.EMPTY;
+        for (CreativeModeTab tab : CreativeModeTabs.tabs()) {
+            for (ItemStack stack : tab.getDisplayItems()) {
+                if (!stack.isEmpty() && stack.getItem() == item) {
+                    creativeStack = stack;
+                    break;
+                }
+            }
+            if (!creativeStack.isEmpty()) break;
+        }
+        if (creativeStack.isEmpty()) return -1;
+
+        int inventorySlot = findCreativeHotbarSlot();
+        if (inventorySlot == -1) return -1;
+
+        // Inventory indices 0-8 map to InventoryMenu slot IDs 36-44.
+        int menuSlot = mc.player.inventoryMenu.findSlot(mc.player.getInventory(), inventorySlot).orElse(-1);
+        if (menuSlot < 36 || menuSlot > 44) return -1;
+
+        ItemStack stack = creativeStack.copyWithCount(creativeStack.getMaxStackSize());
+
+        // Mirror the Creative action locally and send the vanilla serverbound Creative slot packet.
+        mc.player.getInventory().setItem(inventorySlot, stack.copy());
+        mainInventory.set(inventorySlot, stack.copy());
+        mc.gameMode.handleCreativeModeItemAdd(stack, menuSlot);
+
+        return inventorySlot;
+    }
+
+    // Prefer an empty hotbar slot; if all 9 are occupied, replace an existing block stack.
+    private int findCreativeHotbarSlot() {
+        int selectedSlot = mc.player.getInventory().getSelectedSlot();
+
+        if (!autoSwitch.get()) {
+            return isCreativeHotbarSlotUsable(selectedSlot) ? selectedSlot : -1;
+        }
+
+        for (int i = 0; i < 9; i++) {
+            int slot = (selectedSlot + i) % 9;
+            if (isCreativeHotbarSlotUsable(slot) && mainInventory.get(slot).isEmpty()) return slot;
+        }
+
+        for (int i = 0; i < 9; i++) {
+            int slot = (selectedSlot + i) % 9;
+            if (isCreativeHotbarSlotUsable(slot) && mainInventory.get(slot).getItem() instanceof BlockItem) return slot;
+        }
+
         return -1;
+    }
+
+    private boolean isCreativeHotbarSlotUsable(int slot) {
+        if (slot < SlotUtils.HOTBAR_START || slot > SlotUtils.HOTBAR_END || isSlotLocked(slot)) return false;
+
+        ItemStack stack = mainInventory.get(slot);
+        return stack.isEmpty() || stack.getItem() instanceof BlockItem;
     }
 
     // Find a good slot to swap items into
