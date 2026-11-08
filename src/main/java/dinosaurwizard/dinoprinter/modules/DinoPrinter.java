@@ -506,6 +506,18 @@ public class DinoPrinter extends Module {
             mainInventory.add(mc.player.getInventory().getItem(i).copy());
         }
 
+        // Creative refill is performed once per tick and before any placements are queued.
+        // This prevents a later refill from replacing a hotbar slot already referenced by a rotation callback.
+        if (isCreativeRefillActive()) {
+            for (BlockPrint blockPrint : blockPrints) {
+                Item item = blockPrint.asItem();
+                if (hasItemInHotbar(item)) continue;
+
+                getCreativeItemSlot(item);
+                break;
+            }
+        }
+
         // Place blocks!
         int count = 0;
         for (BlockPrint blockPrint : blockPrints) {
@@ -673,25 +685,33 @@ public class DinoPrinter extends Module {
     }
 
     // Find the slot of an item we can print with.
-    // Creative refill is intentionally restricted to the 9 hotbar slots.
+    // When Creative refill is active, only the 9 hotbar slots are considered.
     private int getItemSlot(Item item) {
-        int start = 0;
-        int end = SlotUtils.MAIN_END;
-
-        if (isCreativeRefillActive()) {
-            start = autoSwitch.get() ? SlotUtils.HOTBAR_START : mc.player.getInventory().getSelectedSlot();
-            end = autoSwitch.get() ? SlotUtils.HOTBAR_END : start;
-        }
+        int start = isCreativeRefillActive()
+            ? (autoSwitch.get() ? SlotUtils.HOTBAR_START : mc.player.getInventory().getSelectedSlot())
+            : 0;
+        int end = isCreativeRefillActive()
+            ? (autoSwitch.get() ? SlotUtils.HOTBAR_END : start)
+            : SlotUtils.MAIN_END;
 
         for (int i = start; i <= end; i++) {
             ItemStack stack = mainInventory.get(i);
             if (item != stack.getItem()) continue;
 
+            // If the slot is locked, do not schedule a placement from it this tick.
             if (isSlotLocked(i)) return -1;
             return i;
         }
 
-        return getCreativeItemSlot(item);
+        return -1;
+    }
+
+    private boolean hasItemInHotbar(Item item) {
+        for (int i = SlotUtils.HOTBAR_START; i <= SlotUtils.HOTBAR_END; i++) {
+            if (mainInventory.get(i).getItem() == item) return true;
+        }
+
+        return false;
     }
 
     private boolean isCreativeRefillActive() {
@@ -705,6 +725,10 @@ public class DinoPrinter extends Module {
     // Get a missing item from the currently available Creative inventory tabs.
     private int getCreativeItemSlot(Item item) {
         if (!isCreativeRefillActive() || mc.getConnection() == null) return -1;
+
+        // Creative slot packets are addressed against the player's 45-slot inventory menu.
+        // Do not send them while another container menu is open (its slot IDs are different).
+        if (mc.player.containerMenu != mc.player.inventoryMenu) return -1;
 
         var connection = mc.getConnection();
         if (!connection.isFeatureEnabled(item.requiredFeatures())) return -1;
@@ -736,6 +760,9 @@ public class DinoPrinter extends Module {
         // Mirror the Creative action locally and send the vanilla serverbound Creative slot packet.
         mc.player.getInventory().setItem(inventorySlot, stack.copy());
         mainInventory.set(inventorySlot, stack.copy());
+
+        // Suppress stale inventory sync packets for this slot, as with the normal swap path.
+        printSlots.get(inventorySlot).syncTimer = 0;
         mc.gameMode.handleCreativeModeItemAdd(stack, menuSlot);
 
         return inventorySlot;
