@@ -1,5 +1,7 @@
 name: Publish Development Build
-on: push
+on:
+  push:
+  pull_request:
 
 jobs:
   build:
@@ -26,7 +28,15 @@ jobs:
       - name: Build with Gradle
         run: ./gradlew build
 
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dino-printer-mc26.2
+          path: ./build/libs/*.jar
+          if-no-files-found: error
+
       - name: Release
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
