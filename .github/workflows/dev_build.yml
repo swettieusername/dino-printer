@@ -1,47 +1,43 @@
-name: Publish Development Build
+name: Build Dino Printer (Minecraft 26.2)
 on:
   push:
+    branches:
+      - creative-hotbar-refill
   pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v7
         with:
           persist-credentials: false
 
+      - name: Set up Java 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
-      - name: Set up Java
-        uses: actions/setup-java@v5
-        with:
-          distribution: 'temurin'
-          java-version: 25
-
-      - name: Make Gradle Wrapper executable
+      - name: Make Gradle wrapper executable
         run: chmod +x gradlew
 
-      - name: Build with Gradle
+      - name: Build
         run: ./gradlew build
 
-      - name: Upload build artifact
+      - name: Upload Dino Printer JAR
         uses: actions/upload-artifact@v4
         with:
           name: dino-printer-mc26.2
-          path: ./build/libs/*.jar
+          path: build/libs/*.jar
           if-no-files-found: error
-
-      - name: Release
-        if: github.event_name == 'push'
-        uses: softprops/action-gh-release@v3
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          tag_name: snapshot
-          name: Dev Build
-          prerelease: true
-          files: |
-            ./build/libs/*.jar
