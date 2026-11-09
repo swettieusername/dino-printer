@@ -9,6 +9,11 @@ package dinosaurwizard.dinoprinter.modules;
 import dinosaurwizard.dinoprinter.utils.BlockPrint;
 import dinosaurwizard.dinoprinter.utils.BlockInteract;
 import dinosaurwizard.dinoprinter.utils.RotationManager;
+import dinosaurwizard.dinoprinter.utils.BaritoneBridge;
+import dinosaurwizard.dinoprinter.DinoPrinterAddon;
+import fi.dy.masa.litematica.schematic.placement.SchematicPlacement;
+import fi.dy.masa.litematica.schematic.placement.SubRegionPlacement;
+import net.fabricmc.loader.api.FabricLoader;
 import fi.dy.masa.litematica.config.Configs;
 import fi.dy.masa.litematica.data.DataManager;
 import fi.dy.masa.litematica.world.SchematicWorldHandler;
@@ -17,7 +22,6 @@ import meteordevelopment.meteorclient.MeteorClient;
 import meteordevelopment.meteorclient.events.game.OpenScreenEvent;
 import meteordevelopment.meteorclient.events.packets.PacketEvent;
 import meteordevelopment.meteorclient.events.render.Render3DEvent;
-import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.renderer.ShapeMode;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Categories;
@@ -32,9 +36,9 @@ import meteordevelopment.meteorclient.utils.world.TickRate;
 import meteordevelopment.meteorclient.utils.render.color.Color;
 import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.orbit.EventHandler;
-import meteordevelopment.orbit.EventPriority;
 import net.minecraft.client.gui.screens.inventory.AbstractSignEditScreen;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Vec3i;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.protocol.game.ClientboundBlockUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundContainerSetContentPacket;
@@ -53,6 +57,8 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Mirror;
+import net.minecraft.world.level.block.Rotation;
 import net.minecraft.world.level.block.SignBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
@@ -60,12 +66,14 @@ import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 public class DinoPrinter extends Module {
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     private final SettingGroup sgAdvanced = settings.createGroup("Advanced");
     private final SettingGroup sgInventory = settings.createGroup("Inventory");
+    private final SettingGroup sgMovement = settings.createGroup("Movement");
     private final SettingGroup sgPause = settings.createGroup("Pause");
     private final SettingGroup sgRender = settings.createGroup("Render");
 
@@ -261,6 +269,23 @@ public class DinoPrinter extends Module {
         .build()
     );
 
+    private final Setting<MovementMode> movementMode = sgMovement.add(new EnumSetting.Builder<MovementMode>()
+        .name("movement-mode")
+        .description("Automatically approaches missing schematic blocks using Baritone pathfinding in Survival mode.")
+        .defaultValue(MovementMode.Disabled)
+        .build()
+    );
+
+    private final Setting<Integer> movementSearchRadius = sgMovement.add(new IntSetting.Builder()
+        .name("movement-search-radius")
+        .description("Radius used to find the next missing schematic block before moving to a schematic region.")
+        .defaultValue(32)
+        .range(8, 128)
+        .sliderMax(64)
+        .visible(() -> movementMode.get() != MovementMode.Disabled)
+        .build()
+    );
+
     private final Setting<Integer> slotLockTicks = sgInventory.add(new IntSetting.Builder()
         .name("slot-lock-ticks")
         .description("The time in ticks to lock a slot that was used for swapping items.")
@@ -373,6 +398,19 @@ public class DinoPrinter extends Module {
     private final List<ItemStack> mainInventory = new ArrayList<>(SlotUtils.MAIN_END + 1);
     private final List<PrintSlot> printSlots = createPrintSlots();
 
+    private BlockPos movementTarget;
+    private boolean movementTargetIsBlock;
+    private boolean warnedBaritoneMissing;
+    private boolean warnedMovementModeMismatch;
+
+    private List<MovementBounds> movementScanBounds = new ArrayList<>();
+    private int movementScanBoundsIndex;
+    private int movementScanX, movementScanY, movementScanZ;
+    private int movementScanPlacementCount = -1;
+    private boolean movementScanInitialized;
+    private boolean movementScanComplete;
+    private WorldSchematic movementScanWorld;
+
     private List<PrintSlot> createPrintSlots() {
         List<PrintSlot> slots = new ArrayList<>(SlotUtils.MAIN_END + 1);
         for (int i = 0; i <= SlotUtils.MAIN_END; i++) {
@@ -388,10 +426,13 @@ public class DinoPrinter extends Module {
     @Override
     public void onActivate() {
         reset();
+        warnedBaritoneMissing = false;
+        warnedMovementModeMismatch = false;
     }
 
     @Override
     public void onDeactivate() {
+        stopMovementNavigation();
         reset();
     }
 
@@ -407,9 +448,390 @@ public class DinoPrinter extends Module {
         blockInteracts.clear();
         placedFades.clear();
         mainInventory.clear();
+        movementTarget = null;
+        movementTargetIsBlock = false;
+        resetMovementScan();
 
         for (PrintSlot slot : printSlots) {
             slot.expire();
+        }
+    }
+
+    private boolean isCreativeGameMode() {
+        return mc.player != null && mc.gameMode != null
+            && mc.gameMode.getPlayerMode() == GameType.CREATIVE
+            && mc.player.hasInfiniteMaterials();
+    }
+
+    private boolean isSurvivalGameMode() {
+        return mc.player != null && mc.gameMode != null
+            && mc.gameMode.getPlayerMode() == GameType.SURVIVAL;
+    }
+
+    private boolean isBaritoneLoaded() {
+        return FabricLoader.getInstance().isModLoaded("baritone-meteor")
+            || FabricLoader.getInstance().isModLoaded("baritone");
+    }
+
+    private boolean isMovementAutomationReady() {
+        return movementMode.get() == MovementMode.Survival
+            && isSurvivalGameMode()
+            && isBaritoneLoaded();
+    }
+
+    private void refreshInventorySnapshot() {
+        mainInventory.clear();
+        for (int i = 0; i <= SlotUtils.MAIN_END; i++) {
+            mainInventory.add(mc.player.getInventory().getItem(i).copy());
+        }
+    }
+
+    private boolean canAcquireItemForMovement(Item item) {
+        if (isCreativeRefillActive()) {
+            return autoSwitch.get() || isCreativeHotbarSlotUsable(mc.player.getInventory().getSelectedSlot());
+        }
+
+        if (!autoSwitch.get()) {
+            return mainInventory.get(mc.player.getInventory().getSelectedSlot()).getItem() == item;
+        }
+
+        int slot = getItemSlot(item);
+        if (slot == -1) return false;
+        return slot <= SlotUtils.HOTBAR_END || canInventoryMove();
+    }
+
+    private void updateAutoMovement(WorldSchematic worldSchematic) {
+        if (movementMode.get() == MovementMode.Disabled) {
+            stopMovementNavigation();
+            return;
+        }
+
+        if (!isSurvivalGameMode()) {
+            stopMovementNavigation();
+            if (!warnedMovementModeMismatch) {
+                DinoPrinterAddon.LOG.warn("Dino Printer Survival movement requires the player to be in Survival mode.");
+                warnedMovementModeMismatch = true;
+            }
+            return;
+        }
+
+        warnedMovementModeMismatch = false;
+        if (!isBaritoneLoaded()) {
+            stopMovementNavigation();
+            if (!warnedBaritoneMissing) {
+                DinoPrinterAddon.LOG.warn("Dino Printer Survival movement requires Meteor Baritone 26.2 (baritone-meteor) in the mods folder.");
+                warnedBaritoneMissing = true;
+            }
+            return;
+        }
+        warnedBaritoneMissing = false;
+
+        if (movementTarget != null && isMovementTargetComplete(worldSchematic)) {
+            movementTarget = null;
+            movementTargetIsBlock = false;
+        }
+
+        // A coarse region waypoint gets the player to the schematic while the bounded
+        // background scan continues looking for an actual missing block.
+        if (movementTarget != null && !movementTargetIsBlock) {
+            BlockPos scannedTarget = scanGlobalMovementTarget(worldSchematic);
+            if (scannedTarget != null) {
+                movementTarget = scannedTarget;
+                movementTargetIsBlock = true;
+            } else if (movementScanComplete) {
+                stopMovementNavigation();
+                return;
+            }
+        }
+
+        if (movementTarget == null) {
+            movementTarget = findNextMovementTarget(worldSchematic);
+            movementTargetIsBlock = movementTarget != null;
+
+            if (movementTarget == null) {
+                movementTarget = scanGlobalMovementTarget(worldSchematic);
+                movementTargetIsBlock = movementTarget != null;
+            }
+
+            if (movementTarget == null && !movementScanComplete) {
+                movementTarget = findCoarseMovementTarget();
+                movementTargetIsBlock = false;
+            }
+        }
+
+        if (movementTarget == null) {
+            if (movementScanComplete) stopMovementNavigation();
+            return;
+        }
+
+        if (movementMode.get() == MovementMode.Survival) {
+            int goalRange = movementTargetIsBlock
+                ? Math.max(1, (int) Math.floor(placeRange.get()) - 1)
+                : 2;
+            BaritoneBridge.pathTo(movementTarget, goalRange);
+        }
+    }
+
+    private boolean isMovementTargetComplete(WorldSchematic worldSchematic) {
+        if (movementTarget == null || mc.player == null || mc.level == null) return true;
+
+        if (!movementTargetIsBlock) {
+            return mc.player.blockPosition().distSqr(movementTarget) <= 9;
+        }
+
+        BlockState required = worldSchematic.getBlockState(movementTarget);
+        BlockState existing = mc.level.getBlockState(movementTarget);
+        return !BlockPrint.isValid(movementTarget, required, existing, this);
+    }
+
+    private List<MovementBounds> getMovementBounds() {
+        List<MovementBounds> result = new ArrayList<>();
+
+        for (SchematicPlacement placement : DataManager.getSchematicPlacementManager().getAllSchematicsPlacements()) {
+            if (!placement.isEnabled()) continue;
+
+            var schematic = placement.getSchematic();
+            if (schematic == null) continue;
+
+            for (Map.Entry<String, SubRegionPlacement> entry : placement.getEnabledRelativeSubRegionPlacements().entrySet()) {
+                SubRegionPlacement subRegion = entry.getValue();
+
+                Vec3i relativePosition = transformSchematicVector(
+                    subRegion.getPos(),
+                    placement.getMirror(),
+                    placement.getRotation()
+                );
+
+                Vec3i size = schematic.getAreaSize(entry.getKey());
+                size = transformSchematicVector(size, placement.getMirror(), placement.getRotation());
+                size = transformSchematicVector(size, subRegion.getMirror(), subRegion.getRotation());
+
+                int offsetX = Math.min(size.getX() + 1, 0);
+                int offsetY = Math.min(size.getY() + 1, 0);
+                int offsetZ = Math.min(size.getZ() + 1, 0);
+
+                BlockPos origin = placement.getOrigin()
+                    .offset(relativePosition)
+                    .offset(offsetX, offsetY, offsetZ);
+
+                int sizeX = Math.abs(size.getX());
+                int sizeY = Math.abs(size.getY());
+                int sizeZ = Math.abs(size.getZ());
+                if (sizeX == 0 || sizeY == 0 || sizeZ == 0) continue;
+
+                result.add(new MovementBounds(
+                    origin.getX(), origin.getY(), origin.getZ(),
+                    origin.getX() + sizeX - 1,
+                    origin.getY() + sizeY - 1,
+                    origin.getZ() + sizeZ - 1
+                ));
+            }
+        }
+
+        return result;
+    }
+
+    // Same mirror/rotation transform used by Baritone's 26.2 Litematica adapter.
+    private static Vec3i transformSchematicVector(Vec3i in, Mirror mirror, Rotation rotation) {
+        int x = in.getX();
+        int z = in.getZ();
+
+        if (mirror == Mirror.LEFT_RIGHT) z = -z;
+        else if (mirror == Mirror.FRONT_BACK) x = -x;
+
+        return switch (rotation) {
+            case CLOCKWISE_90 -> new Vec3i(-z, in.getY(), x);
+            case CLOCKWISE_180 -> new Vec3i(-x, in.getY(), -z);
+            case COUNTERCLOCKWISE_90 -> new Vec3i(z, in.getY(), -x);
+            default -> new Vec3i(x, in.getY(), z);
+        };
+    }
+
+    private BlockPos findNextMovementTarget(WorldSchematic worldSchematic) {
+        if (mc.player == null || mc.level == null) return null;
+
+        int px = mc.player.getBlockX();
+        int py = mc.player.getBlockY();
+        int pz = mc.player.getBlockZ();
+        int radius = movementSearchRadius.get();
+        int radiusSq = radius * radius;
+        int bestDistance = Integer.MAX_VALUE;
+        BlockPos best = null;
+        BlockPos.MutableBlockPos mutable = new BlockPos.MutableBlockPos();
+
+        for (MovementBounds bounds : getMovementBounds()) {
+            int minX = Math.max(bounds.minX, px - radius);
+            int minY = Math.max(bounds.minY, py - radius);
+            int minZ = Math.max(bounds.minZ, pz - radius);
+            int maxX = Math.min(bounds.maxX, px + radius);
+            int maxY = Math.min(bounds.maxY, py + radius);
+            int maxZ = Math.min(bounds.maxZ, pz + radius);
+
+            if (minX > maxX || minY > maxY || minZ > maxZ) continue;
+
+            for (int x = minX; x <= maxX; x++) {
+                for (int z = minZ; z <= maxZ; z++) {
+                    for (int y = minY; y <= maxY; y++) {
+                        int dx = x - px;
+                        int dy = y - py;
+                        int dz = z - pz;
+                        int distance = dx * dx + dy * dy + dz * dz;
+                        if (distance > radiusSq || distance >= bestDistance) continue;
+
+                        mutable.set(x, y, z);
+                        if (!DataManager.getRenderLayerRange().isPositionWithinRange(mutable)) continue;
+                        if (!Level.isInSpawnableBounds(mutable)) continue;
+
+                        BlockState required = worldSchematic.getBlockState(mutable);
+                        BlockState existing = mc.level.getBlockState(mutable);
+                        if (!BlockPrint.isValid(mutable, required, existing, this)) continue;
+
+                        Item item = BlockPrint.asItem(required);
+                        if (!canAcquireItemForMovement(item)) continue;
+
+                        bestDistance = distance;
+                        best = new BlockPos(mutable);
+                    }
+                }
+            }
+        }
+
+        return best;
+    }
+
+    private BlockPos findCoarseMovementTarget() {
+        if (mc.player == null) return null;
+
+        BlockPos playerPos = mc.player.blockPosition();
+        BlockPos best = null;
+        double bestDistance = Double.MAX_VALUE;
+
+        for (MovementBounds bounds : getMovementBounds()) {
+            // Once inside a subregion, only move toward a different subregion.
+            // This prevents endless corner-to-corner wandering when a schematic is complete.
+            if (bounds.contains(playerPos)) continue;
+
+            int x = Math.max(bounds.minX, Math.min(bounds.maxX, playerPos.getX()));
+            int y = Math.max(bounds.minY, Math.min(bounds.maxY, playerPos.getY()));
+            int z = Math.max(bounds.minZ, Math.min(bounds.maxZ, playerPos.getZ()));
+            BlockPos candidate = new BlockPos(x, y, z);
+            double distance = playerPos.distSqr(candidate);
+
+            if (distance <= 9 || distance >= bestDistance) continue;
+
+            best = candidate;
+            bestDistance = distance;
+        }
+
+        return best;
+    }
+
+    private void resetMovementScan() {
+        movementScanBounds.clear();
+        movementScanBoundsIndex = 0;
+        movementScanX = 0;
+        movementScanY = 0;
+        movementScanZ = 0;
+        movementScanPlacementCount = -1;
+        movementScanInitialized = false;
+        movementScanComplete = false;
+        movementScanWorld = null;
+    }
+
+    private void initializeMovementScan(WorldSchematic worldSchematic) {
+        movementScanBounds = getMovementBounds();
+        BlockPos playerPos = mc.player.blockPosition();
+        movementScanBounds.sort(Comparator.comparingDouble(bounds -> bounds.distanceToSqr(playerPos)));
+
+        movementScanBoundsIndex = 0;
+        movementScanWorld = worldSchematic;
+        movementScanPlacementCount = DataManager.getSchematicPlacementManager().getAllSchematicsPlacements().size();
+        movementScanInitialized = true;
+        movementScanComplete = movementScanBounds.isEmpty();
+
+        if (!movementScanComplete) {
+            MovementBounds first = movementScanBounds.get(0);
+            movementScanX = first.minX;
+            movementScanY = first.minY;
+            movementScanZ = first.minZ;
+        }
+    }
+
+    private void ensureMovementScanInitialized(WorldSchematic worldSchematic) {
+        int placementCount = DataManager.getSchematicPlacementManager().getAllSchematicsPlacements().size();
+        if (!movementScanInitialized || movementScanWorld != worldSchematic
+            || movementScanPlacementCount != placementCount) {
+            initializeMovementScan(worldSchematic);
+        }
+    }
+
+    private boolean advanceMovementScanCursor() {
+        while (movementScanBoundsIndex < movementScanBounds.size()) {
+            MovementBounds bounds = movementScanBounds.get(movementScanBoundsIndex);
+
+            movementScanY++;
+            if (movementScanY > bounds.maxY) {
+                movementScanY = bounds.minY;
+                movementScanZ++;
+            }
+
+            if (movementScanZ > bounds.maxZ) {
+                movementScanZ = bounds.minZ;
+                movementScanX++;
+            }
+
+            if (movementScanX <= bounds.maxX) return true;
+
+            movementScanBoundsIndex++;
+            if (movementScanBoundsIndex < movementScanBounds.size()) {
+                MovementBounds next = movementScanBounds.get(movementScanBoundsIndex);
+                movementScanX = next.minX;
+                movementScanY = next.minY;
+                movementScanZ = next.minZ;
+            }
+        }
+
+        movementScanComplete = true;
+        return false;
+    }
+
+    private BlockPos scanGlobalMovementTarget(WorldSchematic worldSchematic) {
+        if (mc.player == null || mc.level == null) return null;
+
+        ensureMovementScanInitialized(worldSchematic);
+        if (movementScanComplete) return null;
+
+        final int scanBudget = 8192;
+        BlockPos.MutableBlockPos mutable = new BlockPos.MutableBlockPos();
+
+        for (int scanned = 0; scanned < scanBudget && movementScanBoundsIndex < movementScanBounds.size(); scanned++) {
+            MovementBounds bounds = movementScanBounds.get(movementScanBoundsIndex);
+
+            mutable.set(movementScanX, movementScanY, movementScanZ);
+            if (DataManager.getRenderLayerRange().isPositionWithinRange(mutable)
+                && Level.isInSpawnableBounds(mutable)) {
+                BlockState required = worldSchematic.getBlockState(mutable);
+                BlockState existing = mc.level.getBlockState(mutable);
+
+                if (BlockPrint.isValid(mutable, required, existing, this)
+                    && canAcquireItemForMovement(BlockPrint.asItem(required))) {
+                    // Keep the cursor on this position until it is built or becomes invalid.
+                    return new BlockPos(mutable);
+                }
+            }
+
+            if (!advanceMovementScanCursor()) break;
+        }
+
+        return null;
+    }
+
+    private void stopMovementNavigation() {
+        movementTarget = null;
+        movementTargetIsBlock = false;
+
+        if (isBaritoneLoaded()) {
+            BaritoneBridge.stop();
         }
     }
 
@@ -438,16 +860,22 @@ public class DinoPrinter extends Module {
         }
 
         // Rendering must be active
-        if (!Configs.Visuals.ENABLE_RENDERING.getBooleanValue()) return;
-        if (!Configs.Visuals.ENABLE_SCHEMATIC_RENDERING.getBooleanValue()) return;
+        if (!Configs.Visuals.ENABLE_RENDERING.getBooleanValue() || !Configs.Visuals.ENABLE_SCHEMATIC_RENDERING.getBooleanValue()) {
+            stopMovementNavigation();
+            return;
+        }
 
-        // Pause entire process if necessary
-        if (shouldPause()) return;
+        // Pause the printer and movement while another action requires control.
+        if (shouldPause()) {
+            stopMovementNavigation();
+            return;
+        }
 
         // Clear cached positions every so often
         if (!cachedPositions.isEmpty() && cacheTimer++ >= placeRetryDelay.get()) {
             cachedPositions.clear();
             cacheTimer = 0;
+            resetMovementScan();
         }
 
         // Delay
@@ -494,17 +922,25 @@ public class DinoPrinter extends Module {
             }
         }
 
-        if (blockPrints.isEmpty() && blockInteracts.isEmpty()) return;
+        // Snapshot the inventory before movement selection so Survival can avoid targets
+        // whose required item cannot currently be selected or moved into the hotbar.
+        if (movementMode.get() != MovementMode.Disabled || !blockPrints.isEmpty()) {
+            refreshInventorySnapshot();
+        }
+
+        if (isMovementAutomationReady()) {
+            blockPrints.removeIf(blockPrint -> !canAcquireItemForMovement(blockPrint.asItem()));
+        }
+
+        if (blockPrints.isEmpty() && blockInteracts.isEmpty()) {
+            updateAutoMovement(worldSchematic);
+            return;
+        }
+
+        stopMovementNavigation();
 
         // Sort blocks
         sortBlockPrints();
-
-        // Setup inventory copy
-        // We simulate an entire inventory due to desynchronization with rotations
-        mainInventory.clear();
-        for (int i = 0; i <= SlotUtils.MAIN_END; i++) {
-            mainInventory.add(mc.player.getInventory().getItem(i).copy());
-        }
 
         // Creative refill is performed once per tick and before any placements are queued.
         // This prevents a later refill from replacing a hotbar slot already referenced by a rotation callback.
@@ -645,6 +1081,13 @@ public class DinoPrinter extends Module {
 
     @EventHandler
     private void onPacketReceive(PacketEvent.Receive event)  {
+        // A completed scan may become stale when inventory or schematic blocks change.
+        if (movementScanComplete && (event.packet instanceof ClientboundContainerSetSlotPacket
+            || event.packet instanceof ClientboundContainerSetContentPacket
+            || event.packet instanceof ClientboundBlockUpdatePacket)) {
+            resetMovementScan();
+        }
+
         // Cancel incoming packets that cause misplaces
         // Misplaces are caused when the server resyncs the player but the player already changed their slots again
         if (event.packet instanceof ClientboundContainerSetSlotPacket packet) {
@@ -988,6 +1431,38 @@ public class DinoPrinter extends Module {
         }
 
         blockPrints.sort(comparator);
+    }
+
+    private static final class MovementBounds {
+        final int minX, minY, minZ;
+        final int maxX, maxY, maxZ;
+
+        MovementBounds(int minX, int minY, int minZ, int maxX, int maxY, int maxZ) {
+            this.minX = minX;
+            this.minY = minY;
+            this.minZ = minZ;
+            this.maxX = maxX;
+            this.maxY = maxY;
+            this.maxZ = maxZ;
+        }
+
+        boolean contains(BlockPos pos) {
+            return pos.getX() >= minX && pos.getX() <= maxX
+                && pos.getY() >= minY && pos.getY() <= maxY
+                && pos.getZ() >= minZ && pos.getZ() <= maxZ;
+        }
+
+        double distanceToSqr(BlockPos pos) {
+            int dx = pos.getX() < minX ? minX - pos.getX() : pos.getX() > maxX ? pos.getX() - maxX : 0;
+            int dy = pos.getY() < minY ? minY - pos.getY() : pos.getY() > maxY ? pos.getY() - maxY : 0;
+            int dz = pos.getZ() < minZ ? minZ - pos.getZ() : pos.getZ() > maxZ ? pos.getZ() - maxZ : 0;
+            return (double) dx * dx + (double) dy * dy + (double) dz * dz;
+        }
+    }
+
+    public enum MovementMode {
+        Disabled,
+        Survival
     }
 
     @SuppressWarnings("unused")

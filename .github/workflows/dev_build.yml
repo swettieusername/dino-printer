@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - creative-hotbar-refill
+      - baritone-auto-movement
   pull_request:
     branches:
       - main
