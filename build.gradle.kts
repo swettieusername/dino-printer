@@ -46,6 +46,9 @@ dependencies {
     // Mods
     implementation(libs.litematica)
     implementation(libs.malilib)
+
+    // Optional Baritone API for navigation. Baritone itself is installed separately by the user.
+    compileOnly("meteordevelopment:baritone:26.2-SNAPSHOT")
 }
 
 java {
