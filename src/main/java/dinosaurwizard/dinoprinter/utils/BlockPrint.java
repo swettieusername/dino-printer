@@ -469,12 +469,16 @@ public class BlockPrint {
 
     // Account for edge case blocks that dont map to their respective placer item properly
     public Item asItem() {
-        Block block = required.getBlock();
+        return asItem(required);
+    }
+
+    public static Item asItem(BlockState state) {
+        Block block = state.getBlock();
         if (block instanceof FlowerPotBlock) return Items.FLOWER_POT;
 
-        if (fluid) {
+        if (block instanceof LiquidBlock) {
             if (block == Blocks.WATER) return Items.WATER_BUCKET;
-            if (block == Blocks.LAVA)  return Items.LAVA_BUCKET;
+            if (block == Blocks.LAVA) return Items.LAVA_BUCKET;
         }
 
         return block.asItem();
