@@ -38,6 +38,7 @@ import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.client.gui.screens.inventory.AbstractSignEditScreen;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.Vec3i;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.protocol.game.ClientboundBlockUpdatePacket;
@@ -57,10 +58,13 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.FallingBlock;
 import net.minecraft.world.level.block.Mirror;
 import net.minecraft.world.level.block.Rotation;
 import net.minecraft.world.level.block.SignBlock;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
 import java.util.ArrayList;
@@ -269,6 +273,14 @@ public class DinoPrinter extends Module {
         .build()
     );
 
+    private final Setting<Boolean> temporaryBlocks = sgInventory.add(new BoolSetting.Builder()
+        .name("temporary-blocks")
+        .description("Uses dirt from the 9th hotbar slot as a temporary placement surface when air-place is disabled. The slot is reserved while this option is enabled.")
+        .defaultValue(false)
+        .visible(() -> !airPlace.get())
+        .build()
+    );
+
     private final Setting<MovementMode> movementMode = sgMovement.add(new EnumSetting.Builder<MovementMode>()
         .name("movement-mode")
         .description("Automatically approaches missing schematic blocks using Baritone pathfinding in Survival mode.")
@@ -398,6 +410,24 @@ public class DinoPrinter extends Module {
     private final List<ItemStack> mainInventory = new ArrayList<>(SlotUtils.MAIN_END + 1);
     private final List<PrintSlot> printSlots = createPrintSlots();
 
+    private static final int TEMPORARY_BLOCK_SLOT = SlotUtils.HOTBAR_END;
+    private static final int TEMPORARY_SUPPORT_CONFIRM_TICKS = 20;
+    private static final int TEMPORARY_SUPPORT_TIMEOUT_TICKS = 40;
+    private static final int TEMPORARY_SUPPORT_BREAK_TIMEOUT_TICKS = 100;
+
+    private final Set<BlockPos> attemptedTemporarySupports = new ObjectOpenHashSet<>();
+    private BlockPos attemptedTemporaryTarget;
+    private BlockPos temporarySupportPos;
+    private BlockPos temporaryTargetPos;
+    private BlockState temporaryTargetState;
+    private BlockState temporarySupportState;
+    private boolean temporarySupportCleanupStarted;
+    private boolean temporarySupportBreaking;
+    private int temporarySupportWaitTicks;
+    private int temporarySupportAge;
+    private int temporarySupportCleanupTicks;
+    private boolean warnedTemporaryDirtMissing;
+
     private BlockPos movementTarget;
     private boolean movementTargetIsBlock;
     private boolean warnedBaritoneMissing;
@@ -428,10 +458,12 @@ public class DinoPrinter extends Module {
         reset();
         warnedBaritoneMissing = false;
         warnedMovementModeMismatch = false;
+        warnedTemporaryDirtMissing = false;
     }
 
     @Override
     public void onDeactivate() {
+        cleanupTemporarySupportOnDeactivate();
         stopMovementNavigation();
         reset();
     }
@@ -448,6 +480,7 @@ public class DinoPrinter extends Module {
         blockInteracts.clear();
         placedFades.clear();
         mainInventory.clear();
+        clearTemporarySupport(true);
         movementTarget = null;
         movementTargetIsBlock = false;
         resetMovementScan();
@@ -859,14 +892,17 @@ public class DinoPrinter extends Module {
             pendingHotbarSlot = -1;
         }
 
-        // Rendering must be active
-        if (!Configs.Visuals.ENABLE_RENDERING.getBooleanValue() || !Configs.Visuals.ENABLE_SCHEMATIC_RENDERING.getBooleanValue()) {
+        // Pause the printer and movement while another action requires control.
+        if (shouldPause()) {
             stopMovementNavigation();
             return;
         }
 
-        // Pause the printer and movement while another action requires control.
-        if (shouldPause()) {
+        // Temporary blocks must still be cleaned up if schematic rendering is disabled.
+        if (tickTemporarySupport()) return;
+
+        // Rendering must be active for new placements.
+        if (!Configs.Visuals.ENABLE_RENDERING.getBooleanValue() || !Configs.Visuals.ENABLE_SCHEMATIC_RENDERING.getBooleanValue()) {
             stopMovementNavigation();
             return;
         }
@@ -887,6 +923,7 @@ public class DinoPrinter extends Module {
         int minY = Math.max(mc.level.getMinY(), py - radius);
         int maxY = Math.min(mc.level.getMaxY(), py + radius);
 
+        List<BlockPrint> unplaceableBlockPrints = new ArrayList<>();
         BlockPos.MutableBlockPos blockPos = new BlockPos.MutableBlockPos();
         for (int x = px - radius; x <= px + radius; x++) {
             for (int z = pz - radius; z <= pz + radius; z++) {
@@ -908,6 +945,8 @@ public class DinoPrinter extends Module {
                         BlockPrint blockPrint = new BlockPrint(new BlockPos(blockPos), required, existing, this);
                         if (blockPrint.canPlace()) {
                             blockPrints.add(blockPrint);
+                        } else if (temporaryBlocks.get() && !airPlace.get()) {
+                            unplaceableBlockPrints.add(blockPrint);
                         }
                         continue;
                     }
@@ -924,7 +963,7 @@ public class DinoPrinter extends Module {
 
         // Snapshot the inventory before movement selection so Survival can avoid targets
         // whose required item cannot currently be selected or moved into the hotbar.
-        if (movementMode.get() != MovementMode.Disabled || !blockPrints.isEmpty()) {
+        if (movementMode.get() != MovementMode.Disabled || !blockPrints.isEmpty() || !unplaceableBlockPrints.isEmpty()) {
             refreshInventorySnapshot();
         }
 
@@ -932,7 +971,19 @@ public class DinoPrinter extends Module {
             blockPrints.removeIf(blockPrint -> !canAcquireItemForMovement(blockPrint.asItem()));
         }
 
+        if (temporarySupportPos != null) {
+            blockPrints.removeIf(blockPrint -> !blockPrint.blockPos.equals(temporaryTargetPos));
+            blockInteracts.clear();
+            if (blockPrints.isEmpty()) return;
+        }
+
         if (blockPrints.isEmpty() && blockInteracts.isEmpty()) {
+            if (temporarySupportPos != null) return;
+
+            for (BlockPrint blockPrint : unplaceableBlockPrints) {
+                if (tryPlaceTemporarySupport(blockPrint, worldSchematic)) return;
+            }
+
             updateAutoMovement(worldSchematic);
             return;
         }
@@ -1039,7 +1090,7 @@ public class DinoPrinter extends Module {
             if (mc.player.isUsingItem()) return true;
         }
 
-        if (pauseOnMine.get() && mc.gameMode.isDestroying()) return true;
+        if (pauseOnMine.get() && mc.gameMode.isDestroying() && !temporarySupportBreaking) return true;
 
         if (pauseOnKillAura.get() && Modules.get().get(KillAura.class).attacking) return true;
 
@@ -1234,6 +1285,7 @@ public class DinoPrinter extends Module {
 
     private boolean isCreativeHotbarSlotUsable(int slot) {
         if (slot < SlotUtils.HOTBAR_START || slot > SlotUtils.HOTBAR_END || isSlotLocked(slot)) return false;
+        if (isTemporaryBlockSlotReserved() && slot == TEMPORARY_BLOCK_SLOT) return false;
 
         ItemStack stack = mainInventory.get(slot);
         return stack.isEmpty() || stack.getItem() instanceof BlockItem;
@@ -1243,14 +1295,14 @@ public class DinoPrinter extends Module {
     private int getSwapSlot() {
         // First look for an empty slot in our inventory to use
         for (int i = 0; i < 9; i++) {
-            if (isSlotLocked(i)) continue;
+            if (isSlotLocked(i) || (isTemporaryBlockSlotReserved() && i == TEMPORARY_BLOCK_SLOT)) continue;
 
             if (mainInventory.get(i).isEmpty()) return i;
         }
         // Otherwise swap with an item thats not valuable
         for (int i = 0; i < 9; ++i) {
             int j = (mc.player.getInventory().getSelectedSlot() + i) % 9;
-            if (isSlotLocked(j)) continue;
+            if (isSlotLocked(j) || (isTemporaryBlockSlotReserved() && j == TEMPORARY_BLOCK_SLOT)) continue;
 
             if (isSwappable(mainInventory.get(j))) return j;
         }
@@ -1293,6 +1345,234 @@ public class DinoPrinter extends Module {
     }
 
 
+    /// Temporary placement supports
+
+    private boolean isTemporaryBlockSlotReserved() {
+        return temporaryBlocks.get() && !airPlace.get();
+    }
+
+    private boolean isTemporaryTargetComplete() {
+        if (temporaryTargetPos == null || temporaryTargetState == null || mc.level == null) return false;
+
+        BlockState existing = mc.level.getBlockState(temporaryTargetPos);
+        return existing.getBlock() == temporaryTargetState.getBlock()
+            && !BlockPrint.isIncremental(temporaryTargetState, existing);
+    }
+
+    private void clearTemporarySupport(boolean clearAttempts) {
+        if (temporarySupportPos != null && !clearAttempts) {
+            attemptedTemporarySupports.add(temporarySupportPos);
+        }
+
+        temporarySupportPos = null;
+        temporaryTargetPos = null;
+        temporaryTargetState = null;
+        temporarySupportState = null;
+        temporarySupportCleanupStarted = false;
+        temporarySupportBreaking = false;
+        temporarySupportWaitTicks = 0;
+        temporarySupportAge = 0;
+        temporarySupportCleanupTicks = 0;
+
+        if (clearAttempts) {
+            attemptedTemporaryTarget = null;
+            attemptedTemporarySupports.clear();
+        }
+    }
+
+    private void cleanupTemporarySupportOnDeactivate() {
+        if (temporarySupportPos == null || mc.level == null || mc.gameMode == null) return;
+        if (!mc.level.getBlockState(temporarySupportPos).equals(temporarySupportState)) return;
+
+        if (isCreativeGameMode()) {
+            mc.gameMode.startDestroyBlock(temporarySupportPos, Direction.UP);
+            if (!mc.level.getBlockState(temporarySupportPos).isAir()) {
+                DinoPrinterAddon.LOG.warn("Could not immediately remove Dino Printer's temporary dirt block at {}.", temporarySupportPos);
+            }
+        } else {
+            DinoPrinterAddon.LOG.warn("Dino Printer was disabled while a temporary dirt block remained at {}. Remove it manually if it is still present.", temporarySupportPos);
+        }
+    }
+
+    // Returns true while a temporary support is awaiting confirmation or being cleaned up.
+    private boolean tickTemporarySupport() {
+        if (temporarySupportPos == null) return false;
+        if (mc.player == null || mc.level == null || mc.gameMode == null) {
+            clearTemporarySupport(false);
+            return false;
+        }
+
+        BlockState currentSupport = mc.level.getBlockState(temporarySupportPos);
+
+        if (!currentSupport.equals(temporarySupportState)) {
+            if (++temporarySupportWaitTicks > TEMPORARY_SUPPORT_CONFIRM_TICKS) {
+                clearTemporarySupport(false);
+                return false;
+            }
+            return true;
+        }
+
+        BlockState currentTarget = mc.level.getBlockState(temporaryTargetPos);
+        boolean targetHasRequiredBlock = currentTarget.getBlock() == temporaryTargetState.getBlock();
+
+        if (isTemporaryTargetComplete()) {
+            temporarySupportCleanupStarted = true;
+            attemptedTemporaryTarget = null;
+            attemptedTemporarySupports.clear();
+        } else if (!targetHasRequiredBlock && !currentTarget.isAir() && !currentTarget.canBeReplaced()) {
+            // Someone else changed the target. Do not remove a support that may now be useful.
+            clearTemporarySupport(false);
+            return false;
+        }
+
+        if (!temporaryBlocks.get() || airPlace.get()) {
+            temporarySupportCleanupStarted = true;
+        }
+
+        if (!temporarySupportCleanupStarted && ++temporarySupportAge > TEMPORARY_SUPPORT_TIMEOUT_TICKS) {
+            temporarySupportCleanupStarted = true;
+        }
+
+        if (!temporarySupportCleanupStarted) return false;
+
+        tickTemporarySupportBreak();
+        return true;
+    }
+
+    private void tickTemporarySupportBreak() {
+        if (temporarySupportPos == null || mc.player == null || mc.level == null || mc.gameMode == null) return;
+
+        BlockState current = mc.level.getBlockState(temporarySupportPos);
+        if (!current.equals(temporarySupportState)) {
+            clearTemporarySupport(isTemporaryTargetComplete());
+            return;
+        }
+
+        if (!temporarySupportBreaking) {
+            // Do not take over a block-breaking action started by the player or another module.
+            if (mc.gameMode.isDestroying()) return;
+
+            mc.gameMode.startDestroyBlock(temporarySupportPos, Direction.UP);
+            temporarySupportBreaking = mc.gameMode.isDestroying();
+            mc.player.swing(InteractionHand.MAIN_HAND);
+        } else if (mc.gameMode.isDestroying()) {
+            mc.gameMode.continueDestroyBlock(temporarySupportPos, Direction.UP);
+            mc.player.swing(InteractionHand.MAIN_HAND);
+        } else {
+            temporarySupportBreaking = false;
+        }
+
+        if (mc.level.getBlockState(temporarySupportPos).isAir()) {
+            if (mc.gameMode.isDestroying()) mc.gameMode.stopDestroyBlock();
+            clearTemporarySupport(isTemporaryTargetComplete());
+            return;
+        }
+
+        if (++temporarySupportCleanupTicks > TEMPORARY_SUPPORT_BREAK_TIMEOUT_TICKS) {
+            if (temporarySupportBreaking && mc.gameMode.isDestroying()) mc.gameMode.stopDestroyBlock();
+            DinoPrinterAddon.LOG.warn("Could not remove Dino Printer's temporary dirt block at {}. It was left in the world; check server permissions.", temporarySupportPos);
+
+            boolean targetComplete = isTemporaryTargetComplete();
+            if (!targetComplete && temporaryTargetPos != null) {
+                for (Direction direction : Direction.values()) {
+                    attemptedTemporarySupports.add(temporaryTargetPos.relative(direction));
+                }
+            }
+            clearTemporarySupport(targetComplete);
+        }
+    }
+
+    private boolean tryPlaceTemporarySupport(BlockPrint targetPrint, WorldSchematic worldSchematic) {
+        if (!temporaryBlocks.get() || airPlace.get() || temporarySupportPos != null) return false;
+        if (targetPrint.canPlace() || !canAcquireItemForMovement(targetPrint.asItem())) return false;
+        // Falling blocks can move after their temporary neighbour is removed.
+        if (targetPrint.required.getBlock() instanceof FallingBlock) return false;
+
+        ItemStack temporaryStack = mc.player.getInventory().getItem(TEMPORARY_BLOCK_SLOT);
+        if (temporaryStack.isEmpty() || temporaryStack.getItem() != Items.DIRT) {
+            if (!warnedTemporaryDirtMissing) {
+                DinoPrinterAddon.LOG.warn("Temporary Blocks is enabled, but the 9th hotbar slot must contain Dirt.");
+                warnedTemporaryDirtMissing = true;
+            }
+            return false;
+        }
+        warnedTemporaryDirtMissing = false;
+
+        // In Survival, do not consume the only dirt item if the schematic itself needs dirt next.
+        if (!isCreativeGameMode() && targetPrint.asItem() == Items.DIRT && temporaryStack.getCount() < 2) return false;
+
+        BlockPos targetPos = targetPrint.blockPos;
+        if (!targetPos.equals(attemptedTemporaryTarget)) {
+            attemptedTemporaryTarget = new BlockPos(targetPos);
+            attemptedTemporarySupports.clear();
+        }
+
+        BlockState dirtState = Blocks.DIRT.defaultBlockState();
+
+        for (Direction direction : Direction.values()) {
+            BlockPos supportPos = targetPos.relative(direction);
+            if (attemptedTemporarySupports.contains(supportPos)) continue;
+            if (!Level.isInSpawnableBounds(supportPos)) continue;
+
+            // Never put scaffolding in a position that the schematic itself needs to fill.
+            if (!worldSchematic.getBlockState(supportPos).isAir()) continue;
+
+            BlockState existing = mc.level.getBlockState(supportPos);
+            // Only use plain air. Do not replace plants, fluids, cave air, or player blocks.
+            if (existing.getBlock() != Blocks.AIR) continue;
+
+            AABB supportBox = new AABB(
+                supportPos.getX(), supportPos.getY(), supportPos.getZ(),
+                supportPos.getX() + 1, supportPos.getY() + 1, supportPos.getZ() + 1
+            );
+            if (mc.player.getBoundingBox().intersects(supportBox)) continue;
+
+            if (!BlockPrint.isValid(supportPos, dirtState, existing, this)) continue;
+
+            BlockPrint supportPrint = new BlockPrint(new BlockPos(supportPos), dirtState, existing, this);
+            if (!supportPrint.canPlace()) continue;
+
+            attemptedTemporarySupports.add(new BlockPos(supportPos));
+            temporarySupportPos = new BlockPos(supportPos);
+            temporaryTargetPos = new BlockPos(targetPos);
+            temporaryTargetState = targetPrint.required;
+            temporarySupportState = dirtState;
+            temporarySupportCleanupStarted = false;
+            temporarySupportBreaking = false;
+            temporarySupportWaitTicks = 0;
+            temporarySupportAge = 0;
+            temporarySupportCleanupTicks = 0;
+
+            placeTemporarySupport(supportPrint);
+            placeTimer = 0;
+            return true;
+        }
+
+        return false;
+    }
+
+    private void placeTemporarySupport(BlockPrint supportPrint) {
+        Runnable action = () -> {
+            if (temporarySupportPos == null || !temporarySupportPos.equals(supportPrint.blockPos)) return;
+            if (!supportPrint.isPointValid()) {
+                clearTemporarySupport(false);
+                return;
+            }
+
+            if (interactPlace(supportPrint, TEMPORARY_BLOCK_SLOT, TEMPORARY_BLOCK_SLOT, true)) {
+                printSlots.get(TEMPORARY_BLOCK_SLOT).syncTimer = 0;
+            } else {
+                clearTemporarySupport(false);
+            }
+        };
+
+        if (rotate.get() || supportPrint.shouldRotatePlace()) {
+            RotationManager.rotate(supportPrint.getYaw(), supportPrint.getPitch(), action);
+        } else {
+            action.run();
+        }
+    }
+
     /// Placement
 
     // Custom placement that is far better than meteor's standard
@@ -1308,10 +1588,17 @@ public class DinoPrinter extends Module {
         }
     }
 
-    private void interactPlace(BlockPrint blockPrint, int inventorySlot, int hotbarSlot) {
-        // Send our inputs with sneaking injected
+    private boolean interactPlace(BlockPrint blockPrint, int inventorySlot, int hotbarSlot) {
+        return interactPlace(blockPrint, inventorySlot, hotbarSlot, false);
+    }
+
+    private boolean interactPlace(BlockPrint blockPrint, int inventorySlot, int hotbarSlot, boolean forceHotbarSwitch) {
         boolean isSneaking = mc.player.isShiftKeyDown();
         Input old = mc.player.input.keyPresses;
+        int previousSelectedSlot = -1;
+        boolean switched = false;
+        boolean placed = false;
+
         if (blockPrint.sneaking && !isSneaking) {
             Input sneak = new Input(old.forward(), old.backward(), old.left(), old.right(), old.jump(), true, old.sprint());
             mc.player.input.keyPresses = sneak;
@@ -1319,35 +1606,46 @@ public class DinoPrinter extends Module {
             mc.player.setShiftKeyDown(true);
         }
 
-        if (autoSwitch.get()) {
-            if (inventorySlot > SlotUtils.HOTBAR_END) {
-                InvUtils.quickSwap().fromId(hotbarSlot).to(inventorySlot);
+        try {
+            if (forceHotbarSwitch) {
+                previousSelectedSlot = mc.player.getInventory().getSelectedSlot();
+                switched = InvUtils.swap(hotbarSlot, false);
+            } else if (autoSwitch.get()) {
+                if (inventorySlot > SlotUtils.HOTBAR_END) {
+                    InvUtils.quickSwap().fromId(hotbarSlot).to(inventorySlot);
+                }
+
+                switched = InvUtils.swap(hotbarSlot, swapBack.get());
             }
 
-            InvUtils.swap(hotbarSlot, swapBack.get());
+            // Buckets have their own unique logic.
+            if (blockPrint.fluid) {
+                mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND);
+                swingHand();
+                placed = true;
+            } else {
+                placed = mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, blockPrint.hit).consumesAction();
+                if (placed) swingHand();
+            }
+        } finally {
+            if (forceHotbarSwitch && switched && previousSelectedSlot >= 0) {
+                InvUtils.swap(previousSelectedSlot, false);
+            } else if (!forceHotbarSwitch && autoSwitch.get() && swapBack.get() && switched) {
+                InvUtils.swapBack();
+            }
+
+            if (blockPrint.sneaking && !isSneaking) {
+                mc.player.input.keyPresses = old;
+                mc.getConnection().send(new ServerboundPlayerInputPacket(old));
+                mc.player.setShiftKeyDown(isSneaking);
+            }
         }
 
-        // Buckets have their own unique logic
-        if (blockPrint.fluid) {
-            mc.gameMode.useItem(mc.player, InteractionHand.MAIN_HAND);
-            swingHand();
-        // Otherwise do standard interaction
-        } else if (mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, blockPrint.hit).consumesAction()) {
-            swingHand();
-        }
-
-        if (autoSwitch.get() && swapBack.get()) InvUtils.swapBack();
-
-        // Go back to our old inputs
-        if (blockPrint.sneaking && !isSneaking) {
-            mc.player.input.keyPresses = old;
-            mc.getConnection().send(new ServerboundPlayerInputPacket(old));
-            mc.player.setShiftKeyDown(isSneaking);
-        }
-
-        if (render.get()) {
+        if (placed && render.get()) {
             placedFades.add(new PlacedFade((float) fadeTime.get(), blockPrint.blockPos));
         }
+
+        return placed;
     }
 
     private void interact(BlockInteract blockInteract) {
