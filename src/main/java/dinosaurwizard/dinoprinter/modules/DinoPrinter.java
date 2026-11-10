@@ -511,8 +511,9 @@ public class DinoPrinter extends Module {
                 Item item = blockPrint.asItem();
                 if (hasItemInHotbar(item)) continue;
 
-                getCreativeItemSlot(item);
-                break;
+                // Keep looking if this item cannot be refilled (for example, its
+                // feature is disabled or no safe hotbar slot is available).
+                if (getCreativeItemSlot(item) != -1) break;
             }
         }
 
@@ -552,8 +553,13 @@ public class DinoPrinter extends Module {
                     return;
                 }
 
-                // Simulate count decrement for our simulated inventory
+                // Simulate count decrement for our simulated inventory.
+                // inventoryStack now resides in the simulated hotbar slot.
                 inventoryStack.consume(1, mc.player);
+            } else if (!mc.player.hasInfiniteMaterials()) {
+                // Also decrement simulated hotbar stacks in Survival. Without this,
+                // blocks-per-tick could schedule more placements than the stack holds.
+                mainInventory.get(hotbarSlot).consume(1, mc.player);
             }
 
             if (!autoSwitch.get() && mc.player.getInventory().getSelectedSlot() != hotbarSlot) continue;
@@ -643,6 +649,9 @@ public class DinoPrinter extends Module {
 
     @EventHandler
     private void onPacketReceive(PacketEvent.Receive event)  {
+        // Packet events can arrive while the client is disconnecting.
+        if (mc.player == null || mc.level == null) return;
+
         // Cancel incoming packets that cause misplaces
         // Misplaces are caused when the server resyncs the player but the player already changed their slots again
         if (event.packet instanceof ClientboundContainerSetSlotPacket packet) {
@@ -685,12 +694,21 @@ public class DinoPrinter extends Module {
     // Find the slot of an item we can print with.
     // When Creative refill is active, only the 9 hotbar slots are considered.
     private int getItemSlot(Item item) {
-        int start = isCreativeRefillActive()
-            ? (autoSwitch.get() ? SlotUtils.HOTBAR_START : mc.player.getInventory().getSelectedSlot())
-            : 0;
-        int end = isCreativeRefillActive()
-            ? (autoSwitch.get() ? SlotUtils.HOTBAR_END : start)
-            : SlotUtils.MAIN_END;
+        int start;
+        int end;
+
+        if (!autoSwitch.get()) {
+            // With auto-switch disabled, only the currently selected hotbar slot
+            // may be used. Do not stop at a duplicate stack in another slot.
+            start = mc.player.getInventory().getSelectedSlot();
+            end = start;
+        } else if (isCreativeRefillActive()) {
+            start = SlotUtils.HOTBAR_START;
+            end = SlotUtils.HOTBAR_END;
+        } else {
+            start = 0;
+            end = SlotUtils.MAIN_END;
+        }
 
         for (int i = start; i <= end; i++) {
             ItemStack stack = mainInventory.get(i);
