@@ -63,15 +63,17 @@ public class BlockPrint {
         boolean fluid = required.getBlock() instanceof LiquidBlock;
         if (fluid && (!required.getFluidState().isSource() || !printer.fluids.get())) return false;
 
+        // Do not queue the same position repeatedly while a previous placement
+        // (including an incremental placement such as candles, layers or vines) is
+        // still awaiting server confirmation.
+        if (printer.cachedPositions.contains(blockPos)) return false;
+
         if (!printer.incrementalStates.get() || !isIncremental(required, existing)) {
             // Spot must be air or some other replaceable block
             if (!existing.canBeReplaced()) return false;
 
             // Spot is not already the required blockstate
             if (required.getBlock() == existing.getBlock() && (!fluid || existing.getFluidState().isSource())) return false;
-
-            // Don't place in a position we already attempted
-            if (printer.cachedPositions.contains(blockPos)) return false;
         }
 
         // Check if legally placeable. For example, if its a torch, it can only be placed onto another block.
