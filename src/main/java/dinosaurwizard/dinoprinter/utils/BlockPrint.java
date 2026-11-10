@@ -63,6 +63,14 @@ public class BlockPrint {
         boolean fluid = required.getBlock() instanceof LiquidBlock;
         if (fluid && (!required.getFluidState().isSource() || !printer.fluids.get())) return false;
 
+        // A non-fluid schematic block must have a real BlockItem. Otherwise
+        // asItem() can resolve to AIR, and an empty hotbar slot would look like
+        // a matching item, producing repeated no-op placement attempts.
+        Item placeItem = required.getBlock() instanceof FlowerPotBlock
+            ? Items.FLOWER_POT
+            : required.getBlock().asItem();
+        if (!fluid && !(placeItem instanceof BlockItem)) return false;
+
         // Do not queue the same position repeatedly while a previous placement
         // (including an incremental placement such as candles, layers or vines) is
         // still awaiting server confirmation.
