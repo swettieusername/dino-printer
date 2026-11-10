@@ -49,6 +49,7 @@ import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.SignBlock;
 import net.minecraft.world.level.block.state.BlockState;
@@ -251,6 +252,13 @@ public class DinoPrinter extends Module {
         .build()
     );
 
+    private final Setting<Boolean> creativeRefill = sgInventory.add(new BoolSetting.Builder()
+        .name("creative-refill")
+        .description("Automatically takes missing items from Creative tabs into the 9-slot hotbar, replacing existing block stacks when needed.")
+        .defaultValue(false)
+        .build()
+    );
+
     private final Setting<Integer> slotLockTicks = sgInventory.add(new IntSetting.Builder()
         .name("slot-lock-ticks")
         .description("The time in ticks to lock a slot that was used for swapping items.")
@@ -354,6 +362,7 @@ public class DinoPrinter extends Module {
     private int cacheTimer = 0;
     private int pendingInventorySlot = -1;
     private int pendingHotbarSlot = -1;
+    private AbstractContainerMenu pendingMenu;
     private long lastSignPlaceTime = 0;
     public final Set<BlockPos> cachedPositions = new ObjectOpenHashSet<>();
     private final List<BlockInteract> cachedInteracts = new ArrayList<>();
@@ -386,10 +395,15 @@ public class DinoPrinter extends Module {
     }
 
     private void reset() {
+        // Drop callbacks queued by the previous activation so a late rotation
+        // cannot place a block after the module has been disabled or reset.
+        RotationManager.clearPendingRotations();
+
         placeTimer = 0;
         cacheTimer = 0;
         pendingInventorySlot = -1;
         pendingHotbarSlot = -1;
+        pendingMenu = null;
         lastSignPlaceTime = 0;
         cachedPositions.clear();
         cachedInteracts.clear();
@@ -422,9 +436,14 @@ public class DinoPrinter extends Module {
         });
 
         if (pendingInventorySlot != -1 && pendingHotbarSlot != -1) {
-            InvUtils.quickSwap().fromId(pendingHotbarSlot).to(pendingInventorySlot);
+            // The user may open another container between scheduling and executing
+            // the delayed swap. Never apply inventory indices to a different menu.
+            if (mc.player.containerMenu == pendingMenu) {
+                InvUtils.quickSwap().from(pendingHotbarSlot).to(pendingInventorySlot);
+            }
             pendingInventorySlot = -1;
             pendingHotbarSlot = -1;
+            pendingMenu = null;
         }
 
         // Rendering must be active
@@ -496,6 +515,19 @@ public class DinoPrinter extends Module {
             mainInventory.add(mc.player.getInventory().getItem(i).copy());
         }
 
+        // Creative refill is performed once per tick and before any placements are queued.
+        // This prevents a later refill from replacing a hotbar slot already referenced by a rotation callback.
+        if (isCreativeRefillActive()) {
+            for (BlockPrint blockPrint : blockPrints) {
+                Item item = blockPrint.asItem();
+                if (hasItemInHotbar(item)) continue;
+
+                // Keep looking if this item cannot be refilled (for example, its
+                // feature is disabled or no safe hotbar slot is available).
+                if (getCreativeItemSlot(item) != -1) break;
+            }
+        }
+
         // Place blocks!
         int count = 0;
         for (BlockPrint blockPrint : blockPrints) {
@@ -527,13 +559,19 @@ public class DinoPrinter extends Module {
                 if (printSlots.get(hotbarSlot).isLocked()) {
                     pendingInventorySlot = inventorySlot;
                     pendingHotbarSlot = hotbarSlot;
+                    pendingMenu = mc.player.containerMenu;
                     blockPrints.clear();
                     blockInteracts.clear();
                     return;
                 }
 
-                // Simulate count decrement for our simulated inventory
-                inventoryStack.consume(1, mc.player);
+                // Simulate count decrement for our simulated inventory.
+                // inventoryStack now resides in the simulated hotbar slot.
+                if (!mc.player.hasInfiniteMaterials()) inventoryStack.consume(1, mc.player);
+            } else if (!mc.player.hasInfiniteMaterials()) {
+                // Also decrement simulated hotbar stacks in Survival. Without this,
+                // blocks-per-tick could schedule more placements than the stack holds.
+                mainInventory.get(hotbarSlot).consume(1, mc.player);
             }
 
             if (!autoSwitch.get() && mc.player.getInventory().getSelectedSlot() != hotbarSlot) continue;
@@ -623,6 +661,9 @@ public class DinoPrinter extends Module {
 
     @EventHandler
     private void onPacketReceive(PacketEvent.Receive event)  {
+        // Packet events can arrive while the client is disconnecting.
+        if (mc.player == null || mc.level == null) return;
+
         // Cancel incoming packets that cause misplaces
         // Misplaces are caused when the server resyncs the player but the player already changed their slots again
         if (event.packet instanceof ClientboundContainerSetSlotPacket packet) {
@@ -662,19 +703,117 @@ public class DinoPrinter extends Module {
         }
     }
 
-    // Find the slot of an item we can print with
+    // Find the slot of an item we can print with.
+    // When Creative refill is active, only the 9 hotbar slots are considered.
     private int getItemSlot(Item item) {
-        for (int i = 0; i <= SlotUtils.MAIN_END; i++) {
+        int start;
+        int end;
+
+        if (!autoSwitch.get()) {
+            // With auto-switch disabled, only the currently selected hotbar slot
+            // may be used. Do not stop at a duplicate stack in another slot.
+            start = mc.player.getInventory().getSelectedSlot();
+            end = start;
+        } else if (isCreativeRefillActive()) {
+            start = SlotUtils.HOTBAR_START;
+            end = SlotUtils.HOTBAR_END;
+        } else {
+            start = 0;
+            end = SlotUtils.MAIN_END;
+        }
+
+        for (int i = start; i <= end; i++) {
             ItemStack stack = mainInventory.get(i);
             if (item != stack.getItem()) continue;
 
-            // If we are already in the process of moving this item into the hotbar, dont bother with the same type
+            // If the slot is locked, do not schedule a placement from it this tick.
             if (isSlotLocked(i)) return -1;
-
             return i;
         }
 
         return -1;
+    }
+
+    private boolean hasItemInHotbar(Item item) {
+        for (int i = SlotUtils.HOTBAR_START; i <= SlotUtils.HOTBAR_END; i++) {
+            if (mainInventory.get(i).getItem() == item) return true;
+        }
+
+        return false;
+    }
+
+    private boolean isCreativeRefillActive() {
+        return creativeRefill.get()
+            && mc.player != null
+            && mc.gameMode != null
+            && mc.gameMode.getPlayerMode() == GameType.CREATIVE
+            && mc.player.hasInfiniteMaterials();
+    }
+
+    // Get a missing item from the currently available Creative inventory tabs.
+    private int getCreativeItemSlot(Item item) {
+        if (!isCreativeRefillActive() || mc.getConnection() == null) return -1;
+
+        // Creative slot packets are addressed against the player's 45-slot inventory menu.
+        // Do not send them while another container menu is open (its slot IDs are different).
+        if (mc.player.containerMenu != mc.player.inventoryMenu) return -1;
+
+        var connection = mc.getConnection();
+        if (!connection.isFeatureEnabled(item.requiredFeatures())) return -1;
+
+        // Do not rebuild or enumerate global Creative tabs here. Rebuilding them
+        // from a printer tick can invalidate the Creative inventory search contents
+        // while the inventory screen is open. The required item is already known from
+        // the schematic, so create its normal default stack directly.
+        ItemStack creativeStack = item.getDefaultInstance();
+        if (creativeStack.isEmpty()) return -1;
+
+        int inventorySlot = findCreativeHotbarSlot();
+        if (inventorySlot == -1) return -1;
+
+        // Inventory indices 0-8 map to InventoryMenu slot IDs 36-44.
+        int menuSlot = mc.player.inventoryMenu.findSlot(mc.player.getInventory(), inventorySlot).orElse(-1);
+        if (menuSlot < 36 || menuSlot > 44) return -1;
+
+        ItemStack stack = creativeStack.copyWithCount(creativeStack.getMaxStackSize());
+
+        // Mirror the Creative action locally and send the vanilla serverbound Creative slot packet.
+        mc.player.getInventory().setItem(inventorySlot, stack.copy());
+        mainInventory.set(inventorySlot, stack.copy());
+
+        // Suppress stale inventory sync packets for this slot, as with the normal swap path.
+        printSlots.get(inventorySlot).syncTimer = 0;
+        mc.gameMode.handleCreativeModeItemAdd(stack, menuSlot);
+
+        return inventorySlot;
+    }
+
+    // Prefer an empty hotbar slot; if all 9 are occupied, replace an existing block stack.
+    private int findCreativeHotbarSlot() {
+        int selectedSlot = mc.player.getInventory().getSelectedSlot();
+
+        if (!autoSwitch.get()) {
+            return isCreativeHotbarSlotUsable(selectedSlot) ? selectedSlot : -1;
+        }
+
+        for (int i = 0; i < 9; i++) {
+            int slot = (selectedSlot + i) % 9;
+            if (isCreativeHotbarSlotUsable(slot) && mainInventory.get(slot).isEmpty()) return slot;
+        }
+
+        for (int i = 0; i < 9; i++) {
+            int slot = (selectedSlot + i) % 9;
+            if (isCreativeHotbarSlotUsable(slot) && mainInventory.get(slot).getItem() instanceof BlockItem) return slot;
+        }
+
+        return -1;
+    }
+
+    private boolean isCreativeHotbarSlotUsable(int slot) {
+        if (slot < SlotUtils.HOTBAR_START || slot > SlotUtils.HOTBAR_END || isSlotLocked(slot)) return false;
+
+        ItemStack stack = mainInventory.get(slot);
+        return stack.isEmpty() || stack.getItem() instanceof BlockItem;
     }
 
     // Find a good slot to swap items into
@@ -719,6 +858,12 @@ public class DinoPrinter extends Module {
     private boolean canInventoryMove() {
         if (!autoSwitch.get() || !allowInventory.get()) return false;
 
+        // InvUtils resolves inventory indices against the currently open menu.
+        // Unsupported screens (and non-inventory Creative tabs) must not receive
+        // a swap using a guessed slot ID.
+        if (SlotUtils.indexToId(SlotUtils.HOTBAR_START) < 0
+            || SlotUtils.indexToId(SlotUtils.MAIN_START) < 0) return false;
+
         if (stationaryMove.get() && isPlayerMoving()) return false;
 
         return true;
@@ -759,7 +904,7 @@ public class DinoPrinter extends Module {
 
         if (autoSwitch.get()) {
             if (inventorySlot > SlotUtils.HOTBAR_END) {
-                InvUtils.quickSwap().fromId(hotbarSlot).to(inventorySlot);
+                InvUtils.quickSwap().from(hotbarSlot).to(inventorySlot);
             }
 
             InvUtils.swap(hotbarSlot, swapBack.get());

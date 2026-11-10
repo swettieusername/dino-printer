@@ -80,7 +80,21 @@ public class RotationManager {
         rotate(yaw, pitch, 0, null);
     }
 
+    private static boolean hasPlayerContext() {
+        return mc.player != null && mc.level != null && mc.getConnection() != null;
+    }
+
+    public static void clearPendingRotations() {
+        queue.clear();
+        rotations.clear();
+        lastRotation = null;
+        lastRotationTimer = 0;
+        rotating = false;
+    }
+
     private static void setPrePlayerRotation() {
+        if (!hasPlayerContext()) return;
+
         preYaw = mc.player.getYRot();
         prePitch = mc.player.getXRot();
     }
@@ -97,6 +111,11 @@ public class RotationManager {
 
     @EventHandler(priority = EventPriority.HIGHEST + 100)
     private static void onTickRotations(TickEvent.Pre event) {
+        if (!hasPlayerContext()) {
+            clearPendingRotations();
+            return;
+        }
+
         if (rotations.isEmpty()) return;
 
         setPrePlayerRotation();
@@ -130,6 +149,11 @@ public class RotationManager {
 
     @EventHandler(priority = EventPriority.LOWEST - 1000)
     private static void onTickQueue(TickEvent.Pre event) {
+        if (!hasPlayerContext()) {
+            clearPendingRotations();
+            return;
+        }
+
         if (printer != null && printer.rotateLegitMove.get()) {
             startRotations();
         }
@@ -137,6 +161,11 @@ public class RotationManager {
 
     @EventHandler(priority = EventPriority.LOW)
     private static void onSendMovementPacketsPre(SendMovementPacketsEvent.Pre event) {
+        if (!hasPlayerContext()) {
+            clearPendingRotations();
+            return;
+        }
+
         if (printer != null && !printer.rotateLegitMove.get()) {
             startRotations();
         }
@@ -152,6 +181,11 @@ public class RotationManager {
 
     @EventHandler(priority = EventPriority.LOW)
     private static void onSendMovementPacketsPost(SendMovementPacketsEvent.Post event) {
+        if (!hasPlayerContext()) {
+            clearPendingRotations();
+            return;
+        }
+
         if (rotations.isEmpty()) return;
 
         if (Rotations.rotating) return; // Compatibility with base meteor
@@ -160,7 +194,12 @@ public class RotationManager {
     }
 
     private static void startRotations() {
-        if (printer.isActive()) {
+        if (!hasPlayerContext()) {
+            clearPendingRotations();
+            return;
+        }
+
+        if (printer != null && printer.isActive()) {
             printer.onTickPreRotate();
         }
 
@@ -188,7 +227,7 @@ public class RotationManager {
     }
 
     public static boolean shouldAlterMovementInputs() {
-        return printer != null && rotating && printer.rotateLegitMove.get();
+        return hasPlayerContext() && printer != null && rotating && printer.rotateLegitMove.get();
     }
 
     public static double getYaw(Vec3 pos) {
@@ -221,6 +260,8 @@ public class RotationManager {
     }
 
     private static Input getInputFromRelativeYaw(Input input) {
+        if (!hasPlayerContext()) return input;
+
         int strafe = (input.left() ? 1 : 0) - (input.right() ? 1 : 0);
         int forward = (input.forward() ? 1 : 0) - (input.backward() ? 1 : 0);
         if (strafe == 0 && forward == 0) return input;
@@ -277,6 +318,8 @@ public class RotationManager {
         }
 
         public void sendPacket() {
+            if (!hasPlayerContext()) return;
+
             mc.getConnection().send(new ServerboundMovePlayerPacket.Rot(yaw, pitch, mc.player.onGround(), mc.player.horizontalCollision));
         }
 

@@ -63,15 +63,25 @@ public class BlockPrint {
         boolean fluid = required.getBlock() instanceof LiquidBlock;
         if (fluid && (!required.getFluidState().isSource() || !printer.fluids.get())) return false;
 
+        // A non-fluid schematic block must have a real BlockItem. Otherwise
+        // asItem() can resolve to AIR, and an empty hotbar slot would look like
+        // a matching item, producing repeated no-op placement attempts.
+        Item placeItem = required.getBlock() instanceof FlowerPotBlock
+            ? Items.FLOWER_POT
+            : required.getBlock().asItem();
+        if (!fluid && !(placeItem instanceof BlockItem)) return false;
+
+        // Do not queue the same position repeatedly while a previous placement
+        // (including an incremental placement such as candles, layers or vines) is
+        // still awaiting server confirmation.
+        if (printer.cachedPositions.contains(blockPos)) return false;
+
         if (!printer.incrementalStates.get() || !isIncremental(required, existing)) {
             // Spot must be air or some other replaceable block
             if (!existing.canBeReplaced()) return false;
 
             // Spot is not already the required blockstate
             if (required.getBlock() == existing.getBlock() && (!fluid || existing.getFluidState().isSource())) return false;
-
-            // Don't place in a position we already attempted
-            if (printer.cachedPositions.contains(blockPos)) return false;
         }
 
         // Check if legally placeable. For example, if its a torch, it can only be placed onto another block.
