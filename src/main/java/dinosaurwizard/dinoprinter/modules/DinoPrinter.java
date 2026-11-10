@@ -394,6 +394,10 @@ public class DinoPrinter extends Module {
     }
 
     private void reset() {
+        // Drop callbacks queued by the previous activation so a late rotation
+        // cannot place a block after the module has been disabled or reset.
+        RotationManager.clearPendingRotations();
+
         placeTimer = 0;
         cacheTimer = 0;
         pendingInventorySlot = -1;
@@ -430,7 +434,7 @@ public class DinoPrinter extends Module {
         });
 
         if (pendingInventorySlot != -1 && pendingHotbarSlot != -1) {
-            InvUtils.quickSwap().fromId(pendingHotbarSlot).to(pendingInventorySlot);
+            InvUtils.quickSwap().from(pendingHotbarSlot).to(pendingInventorySlot);
             pendingInventorySlot = -1;
             pendingHotbarSlot = -1;
         }
@@ -555,7 +559,7 @@ public class DinoPrinter extends Module {
 
                 // Simulate count decrement for our simulated inventory.
                 // inventoryStack now resides in the simulated hotbar slot.
-                inventoryStack.consume(1, mc.player);
+                if (!mc.player.hasInfiniteMaterials()) inventoryStack.consume(1, mc.player);
             } else if (!mc.player.hasInfiniteMaterials()) {
                 // Also decrement simulated hotbar stacks in Survival. Without this,
                 // blocks-per-tick could schedule more placements than the stack holds.
@@ -886,7 +890,7 @@ public class DinoPrinter extends Module {
 
         if (autoSwitch.get()) {
             if (inventorySlot > SlotUtils.HOTBAR_END) {
-                InvUtils.quickSwap().fromId(hotbarSlot).to(inventorySlot);
+                InvUtils.quickSwap().from(hotbarSlot).to(inventorySlot);
             }
 
             InvUtils.swap(hotbarSlot, swapBack.get());
