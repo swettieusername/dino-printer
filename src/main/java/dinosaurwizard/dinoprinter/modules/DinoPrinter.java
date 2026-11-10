@@ -362,6 +362,7 @@ public class DinoPrinter extends Module {
     private int cacheTimer = 0;
     private int pendingInventorySlot = -1;
     private int pendingHotbarSlot = -1;
+    private AbstractContainerMenu pendingMenu;
     private long lastSignPlaceTime = 0;
     public final Set<BlockPos> cachedPositions = new ObjectOpenHashSet<>();
     private final List<BlockInteract> cachedInteracts = new ArrayList<>();
@@ -402,6 +403,7 @@ public class DinoPrinter extends Module {
         cacheTimer = 0;
         pendingInventorySlot = -1;
         pendingHotbarSlot = -1;
+        pendingMenu = null;
         lastSignPlaceTime = 0;
         cachedPositions.clear();
         cachedInteracts.clear();
@@ -434,9 +436,14 @@ public class DinoPrinter extends Module {
         });
 
         if (pendingInventorySlot != -1 && pendingHotbarSlot != -1) {
-            InvUtils.quickSwap().from(pendingHotbarSlot).to(pendingInventorySlot);
+            // The user may open another container between scheduling and executing
+            // the delayed swap. Never apply inventory indices to a different menu.
+            if (mc.player.containerMenu == pendingMenu) {
+                InvUtils.quickSwap().from(pendingHotbarSlot).to(pendingInventorySlot);
+            }
             pendingInventorySlot = -1;
             pendingHotbarSlot = -1;
+            pendingMenu = null;
         }
 
         // Rendering must be active
@@ -552,6 +559,7 @@ public class DinoPrinter extends Module {
                 if (printSlots.get(hotbarSlot).isLocked()) {
                     pendingInventorySlot = inventorySlot;
                     pendingHotbarSlot = hotbarSlot;
+                    pendingMenu = mc.player.containerMenu;
                     blockPrints.clear();
                     blockInteracts.clear();
                     return;
@@ -849,6 +857,12 @@ public class DinoPrinter extends Module {
 
     private boolean canInventoryMove() {
         if (!autoSwitch.get() || !allowInventory.get()) return false;
+
+        // InvUtils resolves inventory indices against the currently open menu.
+        // Unsupported screens (and non-inventory Creative tabs) must not receive
+        // a swap using a guessed slot ID.
+        if (SlotUtils.indexToId(SlotUtils.HOTBAR_START) < 0
+            || SlotUtils.indexToId(SlotUtils.MAIN_START) < 0) return false;
 
         if (stationaryMove.get() && isPlayerMoving()) return false;
 
