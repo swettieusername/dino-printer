@@ -84,7 +84,7 @@ public class RotationManager {
         return mc.player != null && mc.level != null && mc.getConnection() != null;
     }
 
-    private static void clearPendingRotations() {
+    public static void clearPendingRotations() {
         queue.clear();
         rotations.clear();
         lastRotation = null;
