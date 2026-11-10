@@ -46,8 +46,6 @@ import net.minecraft.world.entity.player.Input;
 import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.BlockItem;
-import net.minecraft.world.item.CreativeModeTab;
-import net.minecraft.world.item.CreativeModeTabs;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
@@ -733,19 +731,11 @@ public class DinoPrinter extends Module {
         var connection = mc.getConnection();
         if (!connection.isFeatureEnabled(item.requiredFeatures())) return -1;
 
-        boolean hasPermissions = mc.player.canUseGameMasterBlocks() && mc.options.operatorItemsTab().get();
-        CreativeModeTabs.tryRebuildTabContents(connection.enabledFeatures(), hasPermissions, mc.player.level().registryAccess());
-
-        ItemStack creativeStack = ItemStack.EMPTY;
-        for (CreativeModeTab tab : CreativeModeTabs.tabs()) {
-            for (ItemStack stack : tab.getDisplayItems()) {
-                if (!stack.isEmpty() && stack.getItem() == item) {
-                    creativeStack = stack;
-                    break;
-                }
-            }
-            if (!creativeStack.isEmpty()) break;
-        }
+        // Do not rebuild or enumerate global Creative tabs here. Rebuilding them
+        // from a printer tick can invalidate the Creative inventory search contents
+        // while the inventory screen is open. The required item is already known from
+        // the schematic, so create its normal default stack directly.
+        ItemStack creativeStack = item.getDefaultInstance();
         if (creativeStack.isEmpty()) return -1;
 
         int inventorySlot = findCreativeHotbarSlot();
