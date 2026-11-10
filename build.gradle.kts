@@ -38,14 +38,14 @@ repositories {
 dependencies {
     // Fabric
     minecraft(libs.minecraft)
-    implementation(libs.fabric.loader)
+    modImplementation(libs.fabric.loader)
 
     // Meteor
-    implementation(libs.meteor.client)
+    modImplementation(libs.meteor.client)
 
     // Mods
-    implementation(libs.litematica)
-    implementation(libs.malilib)
+    modImplementation(libs.litematica)
+    modImplementation(libs.malilib)
 }
 
 java {
